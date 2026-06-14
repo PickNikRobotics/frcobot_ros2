@@ -1,0 +1,4 @@
+# Build-time shared-library symlinks created when libfairino is loaded.
+# The tracked artifact is the versioned object libfairino.so.2.2.3.
+/fairino_hardware/libfairino/lib/libfairino.so
+/fairino_hardware/libfairino/lib/libfairino.so.2
