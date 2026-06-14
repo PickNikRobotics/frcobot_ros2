@@ -207,6 +207,11 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
         }
         //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ下发位置:%f,%f,%f,%f,%f,%f",\
             cmd.jPos[0],cmd.jPos[1],cmd.jPos[2],cmd.jPos[3],cmd.jPos[4],cmd.jPos[5]);
+        // cmdT (servo command period) must match the controller_manager update_rate.
+        // The arm rejects rates above ~125 Hz (ServoJ error 14), so the loop is
+        // pinned to 125 Hz and cmdT is the matching 8 ms. NOTE: do not feed
+        // period.seconds() here - on the first control cycle it is 0, which the SDK
+        // rejects with error 14. If you change update_rate, update this to match.
         int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
         if(returncode != 0){
             RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
