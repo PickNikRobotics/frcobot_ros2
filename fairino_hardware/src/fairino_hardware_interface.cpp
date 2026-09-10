@@ -143,6 +143,15 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),"初始指令位置: %f,%f,%f,%f,%f,%f",_jnt_position_command[0],\
         _jnt_position_command[1],_jnt_position_command[2],_jnt_position_command[3],_jnt_position_command[4],_jnt_position_command[5]);    
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "机械臂硬件启动成功!");
+        // LATENCY EXPERIMENT 2026-08-26 (agent): announce the servo stream to the
+        // controller. The SDK documents ServoJ as bracketed by ServoMoveStart/End;
+        // this driver previously streamed ServoJ raw, which may leave the controller
+        // treating each command as a discrete buffered motion (~2.1s command->motion
+        // lag measured on the IQ9). Revert this + ServoMoveEnd if it regresses.
+        {
+            errno_t sms = _ptr_robot->ServoMoveStart();
+            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoMoveStart returncode:%d", sms);
+        }
         return hardware_interface::CallbackReturn::SUCCESS;
     }else{
         RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "读取初始关节角度错误，硬件无法启动！请检查通讯内容");
@@ -155,6 +164,11 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
 hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
     RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "Stopping ...please wait...");
+    // LATENCY EXPERIMENT 2026-08-26 (agent): close the servo stream opened in on_activate.
+    {
+        errno_t sme = _ptr_robot->ServoMoveEnd();
+        RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoMoveEnd returncode:%d", sme);
+    }
     _ptr_robot->StopMotion();//停止机器人
     _ptr_robot->CloseRPC();//销毁实例，连接断开
     _ptr_robot.release();
@@ -212,7 +226,7 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
         // pinned to 125 Hz and cmdT is the matching 8 ms. NOTE: do not feed
         // period.seconds() here - on the first control cycle it is 0, which the SDK
         // rejects with error 14. If you change update_rate, update this to match.
-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
+        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.0016,0,0);
         if(returncode != 0){
             RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
         }
