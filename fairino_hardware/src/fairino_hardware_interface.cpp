@@ -33,8 +33,9 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
         // }
 
         //关节状态部分
-        if (joint.state_interfaces.size() != 1) {
-            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"), "Joint '%s' has %zu state interface. 3 expected.",
+        if (joint.state_interfaces.size() < 1 || joint.state_interfaces.size() > 2) {
+            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "Joint '%s' has %zu state interfaces. 1 (position) or 2 (position, velocity) expected.",
                         joint.name.c_str(), joint.state_interfaces.size());
             return hardware_interface::CallbackReturn::ERROR;
         }
@@ -46,12 +47,13 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
             return hardware_interface::CallbackReturn::ERROR;
         }
 
-        // if (joint.state_interfaces[1].name != hardware_interface::HW_IF_VELOCITY) {
-        //     RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
-        //                 "Joint '%s' have %s state interface as second state interface. '%s' expected.", joint.name.c_str(),
-        //                 joint.state_interfaces[1].name.c_str(), hardware_interface::HW_IF_VELOCITY);
-        //     return hardware_interface::CallbackReturn::ERROR;
-        // }
+        if (joint.state_interfaces.size() == 2 &&
+            joint.state_interfaces[1].name != hardware_interface::HW_IF_VELOCITY) {
+            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
+                        "Joint '%s' have %s state interface as second state interface. '%s' expected.", joint.name.c_str(),
+                        joint.state_interfaces[1].name.c_str(), hardware_interface::HW_IF_VELOCITY);
+            return hardware_interface::CallbackReturn::ERROR;
+        }
 
         // if (joint.state_interfaces[2].name != hardware_interface::HW_IF_EFFORT) {
         //     RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
@@ -75,8 +77,10 @@ std::vector<hardware_interface::StateInterface> FairinoHardwareInterface::export
     state_interfaces.emplace_back(hardware_interface::StateInterface(
         info_.joints[i].name, hardware_interface::HW_IF_POSITION, &_jnt_position_state[i]));
 
-    // state_interfaces.emplace_back(hardware_interface::StateInterface(
-    //     info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &_jnt_velocity_state.at(i)));
+    if (info_.joints[i].state_interfaces.size() == 2) {
+      state_interfaces.emplace_back(hardware_interface::StateInterface(
+          info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &_jnt_velocity_state[i]));
+    }
 
     // state_interfaces.emplace_back(hardware_interface::StateInterface(
     //     info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &_jnt_torque_state.at(i)));
@@ -187,6 +191,16 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
     }else{
         return hardware_interface::return_type::ERROR;
     }
+
+    float speed_data[6];
+    returncode = _ptr_robot->GetActualJointSpeedsDegree(1, speed_data);
+    if(returncode == 0){
+        for(int i=0;i<6;i++){
+            _jnt_velocity_state[i] = speed_data[i]/180.0*M_PI;//deg/s -> rad/s
+        }
+    }else{
+        return hardware_interface::return_type::ERROR;
+    }
     //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "System successfully read: %f,%f,%f,%f,%f,%f",_jnt_position_state[0],\
     _jnt_position_state[1],_jnt_position_state[2],_jnt_position_state[3],_jnt_position_state[4],_jnt_position_state[5]);
 
@@ -208,9 +222,38 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
         }
         //RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ下发位置:%f,%f,%f,%f,%f,%f",\
             cmd.jPos[0],cmd.jPos[1],cmd.jPos[2],cmd.jPos[3],cmd.jPos[4],cmd.jPos[5]);
-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
+        // cmdT (servo command period) must match the controller_manager update_rate.
+        // The FR5 SDK recommends cmdT in [0.001, 0.0016] s; outside that range the
+        // servo interpolator buffers commands and lurches. cmdT is 1.6 ms, so the
+        // controller_manager update_rate must be 625 Hz. NOTE: do not feed
+        // period.seconds() here - on the first control cycle it is 0, which the SDK
+        // rejects with error 14. If you change update_rate, update this to match.
+        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.0016,0,0);
+        // Halt the stream when the arm rejects ServoJ instead of hammering it.
+        // A single stray rejection can be transient, but a SUSTAINED run of them
+        // (e.g. error code 14 when the FR5 refuses a fast multi-joint setpoint)
+        // means the arm is not executing; continuing to stream just produces a
+        // 100+/sec error storm that latches a robot-side fault and forces a full
+        // down/up recovery. Returning ERROR propagates the fault to ros2_control,
+        // which deactivates the controller and stops the stream cleanly (the move
+        // aborts like a normal fault rather than storming).
+        static int servoj_consecutive_errors = 0;
+        static constexpr int kServoJErrorHaltThreshold = 5;  // ~8 ms at 625 Hz
         if(returncode != 0){
-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
+            servoj_consecutive_errors++;
+            RCLCPP_WARN(rclcpp::get_logger("FairinoHardwareInterface"),
+                "ServoJ指令下发错误,错误码:%d (consecutive:%d/%d)",
+                returncode, servoj_consecutive_errors, kServoJErrorHaltThreshold);
+            if(servoj_consecutive_errors >= kServoJErrorHaltThreshold){
+                RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
+                    "ServoJ rejected %d consecutive commands (code:%d) — halting stream to "
+                    "avoid an error storm; aborting trajectory.",
+                    servoj_consecutive_errors, returncode);
+                servoj_consecutive_errors = 0;
+                return hardware_interface::return_type::ERROR;
+            }
+        }else{
+            servoj_consecutive_errors = 0;  // reset on any successful command
         }
     }else if(_control_mode == 1){//扭矩控制模式
         if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\
